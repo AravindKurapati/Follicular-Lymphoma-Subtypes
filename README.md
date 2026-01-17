@@ -8,7 +8,7 @@ This project investigates whether **H&E-stained whole slide images (WSIs)** can 
 
 ## Motivation
 
-Follicular lymphoma is clinically heterogeneous. ~20% of patients progress rapidly with poor outcomes, while others remain indolent for years. RNA-seq reveals transcriptional subtypes that predict prognosis — but:
+Follicular lymphoma is clinically heterogeneous. ~20% of patients progress rapidly with poor outcomes, while others remain indolent for years. RNA-seq reveals transcriptional subtypes that predict prognosis, but:
 
 - **RNA-seq is expensive, slow, and unavailable in most labs**
 - **H&E slides are free, instant, and everywhere**
