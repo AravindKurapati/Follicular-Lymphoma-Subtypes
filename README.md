@@ -2,7 +2,7 @@
 
 **Can deep learning infer molecular subtypes from routine pathology images?**
 
-This project investigates whether **H&E-stained whole slide images (WSIs)** can predict the **transcriptional subtypes of follicular lymphoma (FL)** — traditionally defined using RNA sequencing. The work bridges histopathology and precision oncology by asking: *What does biology look like under a microscope?*
+This project investigates whether **H&E-stained whole slide images (WSIs)** can predict the **transcriptional subtypes of follicular lymphoma (FL)**  traditionally defined using RNA sequencing. The work bridges histopathology and precision oncology by asking: *What does biology look like under a microscope?*
 
 ---
 
