@@ -15,174 +15,215 @@ Follicular lymphoma is clinically heterogeneous. ~20% of patients progress rapid
 
 The question: Can we infer molecular subtypes from morphology alone?
 
+---
 
-## The Problem Nobody Warns You About
+## Repository Structure
 
-Building models on pathology images is messier than papers suggest. Most of the  work happens in data prep, not model architecture:
-
-- **Patch extraction**: Gigapixel WSIs (100,000 × 100,000 pixels) must be chunked into 224×224 tiles
-- **Filtering**: Most patches are garbage—white space (background), pen marks, out-of-focus regions, scanner artifacts
-- **Tissue quality**: "Too white" and "too black" are subjective; thresholds vary wildly across slides from different labs
-
-**Core insight**: Patch quality is not just "data cleaning." 
+```
+Follicular-Lymphoma-Subtypes/
+│
+├── data_prep.py          # WSI patch extraction & tissue filtering
+├── ssl_train.py          # Barlow Twins self-supervised pretraining (ResNet-50)
+├── clustering.py         # Leiden clustering + UMAP visualization
+├── feature_extraction.py # Encode patches → .npz slide feature bags (ViT or ResNet)
+├── mil_train.py          # Gated Attention MIL training & evaluation
+├── dino_encoder.py       # DINO ViT encoder (planned replacement for ImageNet ViT)
+├── attention_viz.py      # Attention heatmap overlay on WSI thumbnails
+└── README.md
+```
 
 ---
 
-## What We Built
+## Pipeline Overview
 
 ```
 Raw WSI (gigapixel)
   ↓
-Extract & filter patches (224×224, background removed)
+data_prep.py        — Extract & filter 224×224 patches
   ↓
-Self-supervised learning (Barlow Twins + ResNet-50)
-  → Learn tissue patterns without labels
+ssl_train.py        — Barlow Twins + ResNet-50 (self-supervised, no labels)
   ↓
-Cluster & validate (Leiden + UMAP)
-  → Verify the model learned real biology
+clustering.py       — Leiden clustering + UMAP to validate learned morphology
   ↓
-Slide-level classification (Gated Attention MIL)
-  → Predict FL subtype + show which regions matter
+feature_extraction.py — Encode patches → slide-level .npz bags
+                        [Encoder: ViT-B/16 | ResNet-50 SSL | DINO ViT (planned)]
   ↓
-Multimodal fusion (In progress)
-  → Combine image embeddings with RNA-seq
+mil_train.py        — Gated Attention MIL → slide-level FL subtype prediction
+  ↓
+attention_viz.py    — Visualize which WSI regions drove the prediction
+  ↓
+[In progress]       — Multimodal fusion with RNA-seq features
 ```
 
 ---
 
 ## Architecture
 
-### 1. Patch Extraction & Filtering
+### 1. Patch Extraction & Filtering (`data_prep.py`)
 
-Extract 224×224 patches from WSI and filter aggressively:
-- Discard patches >80% white (background)
-- Discard patches that are too black (artifacts, out of focus)
-- Use grayscale distribution and entropy heuristics for borderline cases
+Extract 224×224 patches from gigapixel WSIs with aggressive tissue filtering:
 
-**Result**: ~800-1000 high-quality patches per slide
+- Discard patches >80% white (background/glass)
+- Discard patches that are too dark (artifacts, out-of-focus)
+- Grayscale entropy heuristics for borderline cases
 
-### 2. Self-Supervised Learning (Barlow Twins + ResNet-50)
+**Result**: ~800–1000 high-quality tissue patches per slide.
 
-Train without labels on unlabeled patches:
+### 2. Self-Supervised Learning — Barlow Twins (`ssl_train.py`)
+
+Train a ResNet-50 backbone on unlabeled patches using Barlow Twins:
 
 ```
 For each patch:
-  1. Create two strongly augmented views (crops, color jitter, blur, flip)
-  2. Pass both through ResNet-50 backbone → remove final FC layer
-  3. Pass outputs through small MLP projector
-  4. Barlow Twins loss: make embeddings of same patch similar, 
-     but keep feature dimensions uncorrelated
+  1. Create two strongly augmented views (crop, color jitter, blur, flip)
+  2. Pass both through ResNet-50 backbone (no FC) → MLP projector
+  3. Barlow Twins loss:
+     - Diagonal of cross-correlation matrix → 1 (invariance)
+     - Off-diagonal → 0 (redundancy reduction)
 
-Result: 2048D patch encoder capturing morphology
+Result: 2048-dim patch encoder adapted to H&E stain and FL morphology
 ```
 
-**Why SSL?** Labeling 800k patches is impossible. SSL lets the model discover tissue structure on its own.
+**Why SSL?** Labeling 800K+ patches is infeasible. SSL lets the model learn tissue structure entirely unsupervised, adapting to domain-specific H&E characteristics that ImageNet pretraining never sees.
 
-### 3. Clustering & Validation (Leiden + UMAP)
+### 3. Clustering & Biological Validation (`clustering.py`)
 
-After SSL training, cluster patch embeddings to validate what the model learned:
+After SSL training, cluster patch embeddings to verify the encoder learned real biology:
 
 ```
-1. Build k-nearest neighbors graph of patch embeddings
-2. Run Leiden clustering (community detection algorithm)
-3. Reduce to 2D using UMAP, color by cluster ID
-4. Manually inspect representative patches from each cluster
+1. Build k-NN graph of patch embeddings (k=15)
+2. Run Leiden community detection
+3. Reduce to 2D with UMAP, color by cluster
+4. Overlay FL1 / NotFL1 labels to check subtype enrichment
 ```
 
-**What to look for:**
-- Each color represents a distinct morphological neighborhood
-- If clusters are spatially organized and interpretable (immune-dense, fibrotic, follicles), the SSL encoder learned real patterns
-- If it's a uniform blob, the model learned noise
+**Results**: Spearman ρ = 0.42 (p < 0.001) between cluster membership and transcriptional subtype — confirming the encoder captured meaningful morphological structure, not noise.
 
-**Key insight**: If the UMAP were random, all 10,000 patches would scatter uniformly with no coherent clusters. Instead, clear topological separation tells us the model picked up on real biology.
+Identified morphological neighborhoods include:
+- **Immune-dense regions**: High cellularity, T-cell-rich
+- **Follicular structures**: Distinct gland-like formations
+- **Sparse/fibrotic regions**: Low cellularity, stromal tissue
 
-### 4. Slide-Level Classification (Gated Attention MIL)
+### 4. Feature Extraction (`feature_extraction.py`)
 
- Multiple Instance Learning learns which patches matter:
+Encode all patches into `.npz` slide-level feature bags:
 
-**Patch aggregation explained:**
-- You have ~10,000 patches per slide, each with a 2048-dim embedding
-- MIL learns attention weights for each patch
-- Slide representation = weighted sum of patch embeddings
-- Goes from gigapixel image (billions of pixel values) → single 2048-dim vector
-
-**Gated Attention MIL:**
 ```python
-# V: feature projection (Tanh)
-# U: gating mechanism (Sigmoid)
-# w: learned attention weights
-# Output: per-patch attention + slide-level prediction
+ENCODER = "vit"     # "vit" | "resnet" | "dino" (planned)
 ```
 
+Each `.npz` stores:
+- `feats`: `[N_patches, embed_dim]` — patch embeddings
+- `coords`: `[N_patches, 2]` — (x, y) coordinates in level-0 space
+- `label`: binary FL subtype label
+- `slide_id`: slide identifier
 
--  Attention maps show which regions drove the prediction
--  Immune-dense regions get high attention, sparse regions get low
--  Not all biopsy regions are equally informative
+### 5. Gated Attention MIL (`mil_train.py`)
+
+Slide-level classification using Multiple Instance Learning:
+
+```
+~800 patches per slide (each with d-dim embedding)
+  ↓
+Gated Attention:
+  V(h) = Tanh(W_V · h)     # content projection
+  U(h) = Sigmoid(W_U · h)  # gating
+  A = Softmax(w · (V ⊙ U)) # per-patch attention weights
+  z = Σ A_i · h_i           # weighted slide representation
+  ↓
+Linear classifier → FL1 / NotFL1
+```
+
+Attention weights reveal **which tissue regions drive the prediction** — not just what the model decided, but where it looked.
+
+### 6. DINO ViT Encoder (`dino_encoder.py`) — Planned
+
+The current ViT-B/16 uses generic ImageNet pretraining. DINO-pretrained ViTs are significantly better suited for pathology because:
+
+- DINO's self-attention heads naturally attend to **semantically meaningful regions** — in histology this maps well to follicles, stroma, immune infiltrates
+- DINO was shown to produce spatially coherent attention maps without any supervision
+- Domain-specific DINO models (e.g. [CONCH](https://github.com/mahmoodlab/CONCH), [UNI](https://github.com/mahmoodlab/UNI)) pretrained on pathology data are available and expected to outperform generic ImageNet ViT
+
+**Planned**: replace `vit_b_16(IMAGENET1K_V1)` with a DINO-pretrained ViT backbone, either via `torch.hub` or a pathology foundation model checkpoint.
 
 ---
 
-## Classification Decision: FL1 vs NotFL1
+## Encoder Comparison
 
-Ideally, we'd build a 7-way classifier for all FL subtypes. But the data didn't support it:
-- FL6 and FL4 had only 3-4 samples each
-- Deep learning on tiny datasets is a classic recipe for overfitting
+| Encoder | Pretraining | Domain | Accuracy | AUC |
+|---|---|---|---|---|
+| ResNet-50 (SSL) | Barlow Twins on FL patches | In-domain | 78% | 0.65 |
+| ViT-B/16 | ImageNet supervised | Out-of-domain | 71% | 0.58 |
+| ViT-B/16 (alt) | ImageNet supervised | Out-of-domain | 69% | 0.55 |
+| DINO ViT | Pathology SSL (planned) | In-domain | TBD | TBD |
 
-**Pragmatic choice**: Binary classification. FL1 (most common, sufficient data) vs everything else (NotFL1). This gives us a working pipeline; multi-class classification scales as data grows.
-
----
-
-## ResNet vs ViT: What Actually Happened
-
-Tested two encoders with the same MIL aggregation:
-
-| Backbone | Accuracy | AUC |
-|----------|----------|-----|
-| SSL ResNet-50 (domain-adapted) | 78% | 0.65 |
-| ImageNet ViT (generic pretrain) | 71% | 0.58 |
-| ImageNet ViT (alternative) | 69% | 0.55 |
-
-**Why ResNet won**: It has strong inductive bias for local texture—exactly what histology needs. I trained ResNet self-supervised on my own FL patches, so it adapted to H&E stain, scanner style, and FL-specific morphology. The ViT used generic ImageNet pretraining with no domain-specific learning.
-
-**Honest caveat**: This wasn't ResNet vs ViT fundamentally. It was domain-adapted ResNet vs generic ViT. If I pretrain a ViT with SSL on FL patches, the story might change. Domain adaptation matters more than architecture at this scale.
+**Key insight**: ResNet won because it was domain-adapted via SSL on FL patches specifically, while the ViT used generic ImageNet pretraining. This comparison is not ResNet vs ViT architecturally — it's *domain-adapted* vs *generic*. A DINO ViT pretrained on pathology data is the natural next step.
 
 ---
 
-## Clustering Results
+## Classification Design: FL1 vs NotFL1
 
-Leiden clustering on SSL embeddings revealed distinct morphological neighborhoods. Example clusters:
+Ideally a 7-way classifier across all FL subtypes, but data constraints made this impractical:
 
-- **Immune-dense clusters**: High cellularity, T-cell markers visible
-- **Sparse/fibrotic clusters**: Low cellularity, stromal regions
-- **Follicle clusters**: Specific gland structures
+- FL6 and FL4 had only 3–4 samples each — deep learning on tiny classes is a recipe for overfitting
+- **Pragmatic choice**: Binary FL1 vs NotFL1 gives a working, generalizable pipeline
 
-**Biological validation:**
-- Spearman correlation between cluster membership and transcriptional subtype: ρ = 0.42 (p < 0.001)
-- When overlaying FL1 vs NotFL1 labels: some clusters enriched for one subtype, others present in both
-
-This proves the model learned meaningful morphological structure, not random noise.
+Multi-class classification becomes tractable as data grows.
 
 ---
 
 ## Multimodal Fusion (In Progress)
 
-Current approach:
-1. Aggregate patch embeddings into slide-level vector (via attention-MIL)
+Combining WSI-derived embeddings with RNA-seq features:
+
+1. Aggregate patch embeddings → slide vector via attention-MIL
 2. Combine with RNA-seq features (gene expression, pathway scores, cell-type signatures)
-3. Train multimodal model on image + transcriptomic features
+3. Train joint model on image + transcriptomic inputs
 
 **Early results:**
-- H&E only: 71% accuracy
-- RNA only: 85% accuracy
-- H&E + RNA (WIP): Expected >90%
+
+| Modality | Accuracy |
+|---|---|
+| H&E only | 71% |
+| RNA-seq only | 85% |
+| H&E + RNA (in progress) | expected >90% |
 
 ---
 
+## Setup
 
+```bash
+pip install openslide-python torch torchvision tqdm scikit-learn \
+            umap-learn leidenalg igraph albumentations pandas openpyxl
+apt-get install -y openslide-tools
+```
+
+**Data**: WSI `.svs` files + slide key Excel (`fl slide key.xlsx`) with FL subtype labels.
 
 ---
 
+## Usage
 
+```bash
+# 1. Extract patches from WSIs
+python data_prep.py
 
+# 2. SSL pretraining (ResNet-50 + Barlow Twins)
+python ssl_train.py
+
+# 3. Cluster patch embeddings to validate encoder
+python clustering.py
+
+# 4. Encode patches into slide-level .npz bags
+#    Set ENCODER = "vit" | "resnet" | "dino" in feature_extraction.py
+python feature_extraction.py
+
+# 5. Train MIL classifier
+python mil_train.py
+
+# 6. Visualize attention maps
+python attention_viz.py
+```
 
 ---
 
@@ -190,20 +231,19 @@ Current approach:
 
 If you use this code or reference the approach, please cite:
 
-```bibtex
+```
 @article{kurapati2024pathology,
-  title={Pathology Meets Genomics: Predicting FL Transcriptional Subtypes from H&E Histology},
-  author={Kurapati, Aravind S. and Park, Christopher and others},
-  journal={TBD},
-  year={2024}
+  title   = {Pathology Meets Genomics: Predicting FL Transcriptional Subtypes from H&E Histology},
+  author  = {Kurapati, Aravind S. and Park, Christopher and others},
+  journal = {TBD},
+  year    = {2024}
 }
 ```
 
 ---
 
-## Medium Post
+## Medium
 
-For the full story behind this work, please see my medium:
+For the full write-up and intuition behind this work:
 
 **[Pathology Meets Genomics: A Multimodal Approach to FL Classification](https://medium.com/@aravind.kurapati/pathology-meets-genomics)**
-
