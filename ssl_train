@@ -1,0 +1,144 @@
+"""
+Self-supervised pretraining using Barlow Twins on unlabeled WSI patches.
+Trains a ResNet-50 backbone to learn morphological representations without any subtype labels.
+Saves encoder weights to: barlow_encoder_resnet50.pth
+"""
+
+import os
+import glob
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+SSL_PATCH_DIR = "/kaggle/working/ssl_patches"
+SAVE_PATH     = "/kaggle/working/barlow_encoder_resnet50.pth"
+PROJ_DIM      = 128
+BATCH_SIZE    = 128
+NUM_EPOCHS    = 30
+LR            = 3e-4
+LAMBD         = 5e-3   # off-diagonal penalty weight in Barlow Twins loss
+# ─────────────────────────────────────────────────────────────────────────────
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ── Augmentation pipeline ────────────────────────────────────────────────────
+
+bt_aug = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+    transforms.RandomGrayscale(p=0.2),
+    transforms.GaussianBlur(kernel_size=9),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+])
+
+
+# ── Dataset ──────────────────────────────────────────────────────────────────
+
+class BarlowTwinsDataset(Dataset):
+    """
+    Returns two independently augmented views of the same patch.
+    Directory structure: ssl_patches/<slide_id>/*.png
+    """
+    def __init__(self, root_dir: str, transform):
+        self.image_paths = glob.glob(os.path.join(root_dir, "*", "*.png"))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert("RGB")
+        return self.transform(img), self.transform(img)
+
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+class BarlowTwinsModel(nn.Module):
+    """
+    ResNet-50 backbone (no FC) + MLP projector head for Barlow Twins.
+
+    Args:
+        base_model: torchvision backbone name (default 'resnet50')
+        proj_dim:   output dimension of projector MLP
+    """
+    def __init__(self, base_model: str = "resnet50", proj_dim: int = PROJ_DIM):
+        super().__init__()
+        self.backbone = getattr(models, base_model)(pretrained=False)
+        self.backbone.fc = nn.Identity()
+
+        # infer backbone output dimension
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224)
+            feat_dim = self.backbone(dummy).shape[1]
+
+        self.projector = nn.Sequential(
+            nn.Linear(feat_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, proj_dim),
+        )
+
+    def forward(self, x):
+        return self.projector(self.backbone(x))
+
+
+# ── Loss ─────────────────────────────────────────────────────────────────────
+
+def barlow_loss(z1: torch.Tensor, z2: torch.Tensor, lambd: float = LAMBD) -> torch.Tensor:
+    """
+    Barlow Twins loss.
+
+    Encourages:
+    - Invariance: diagonal of cross-correlation matrix → 1
+    - Decorrelation: off-diagonal → 0
+
+    Args:
+        z1, z2: projected embeddings [batch_size, proj_dim]
+        lambd:  penalty weight for off-diagonal terms
+    """
+    N, D = z1.size()
+    z1_norm = (z1 - z1.mean(0)) / (z1.std(0) + 1e-8)
+    z2_norm = (z2 - z2.mean(0)) / (z2.std(0) + 1e-8)
+    c = (z1_norm.T @ z2_norm) / N          # [D, D] cross-correlation matrix
+
+    on_diag  = torch.diagonal(c).add_(-1).pow(2).sum()
+    off_diag = (c - torch.eye(D, device=c.device)).pow(2).sum() - torch.diagonal(c).add_(-1).pow(2).sum()
+    return on_diag + lambd * off_diag
+
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+
+def train():
+    dataset = BarlowTwinsDataset(SSL_PATCH_DIR, bt_aug)
+    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+    model     = nn.DataParallel(BarlowTwinsModel()).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        total_loss = 0.0
+        for x1, x2 in tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}"):
+            x1, x2 = x1.to(device), x2.to(device)
+            z1, z2 = model(x1), model(x2)
+            loss = barlow_loss(z1, z2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1} | Avg Loss: {total_loss / len(loader):.4f}")
+
+    torch.save(model.module.backbone.state_dict(), SAVE_PATH)
+    print(f"\nEncoder saved → {SAVE_PATH}")
+
+
+if __name__ == "__main__":
+    train()
