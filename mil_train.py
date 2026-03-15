@@ -1,13 +1,18 @@
 """
-Train a Gated Attention Multiple Instance Learning (MIL) classifier
-on slide-level .npz feature bags to predict FL subtype.
+Train a MIL classifier on slide-level .npz feature bags to predict FL subtype.
 
-Features bags are produced by feature_extraction.py.
+Two aggregators are supported (set MIL_TYPE in CONFIG):
+  "attn"    — Gated Attention MIL
+  "transmil" — Single-layer Transformer MIL (mean-pool aggregation)
+
+Feature bags are produced by feature_extraction.py. Point FEAT_DIR at one of:
+  /kaggle/working/slide_feats_resnet
+  /kaggle/working/slide_feats_vit
+  /kaggle/working/slide_feats_dino
 """
 
 import os
 import glob
-import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -15,14 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import (
-    accuracy_score, confusion_matrix, roc_auc_score, roc_curve
-)
-from sklearn.preprocessing import label_binarize
-from collections import Counter
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score, roc_curve
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-FEAT_DIR          = "/kaggle/working/slide_feats"
+FEAT_DIR          = "/kaggle/working/slide_feats_resnet"  # swap to _vit or _dino
+MIL_TYPE          = "attn"       # "attn" | "transmil"
 MAX_PATCHES_TRAIN = 800
 MAX_PATCHES_VAL   = 1200
 EPOCHS            = 10
@@ -60,9 +62,9 @@ class SlideBagDataset(Dataset):
 
     def __getitem__(self, i):
         data = np.load(self.paths[i])
-        h = data["feats"]      # [N, d]
+        h = data["feats"]   # [N, d]
         y = int(data["label"])
-        c = data["coords"]     # [N, 2]
+        c = data["coords"]  # [N, 2]
         if self.train and self.max_patches and h.shape[0] > self.max_patches:
             idx = np.random.choice(h.shape[0], self.max_patches, replace=False)
             h, c = h[idx], c[idx]
@@ -75,7 +77,7 @@ def collate_bags(batch):
     return xs, torch.stack(ys), coords
 
 
-# ── Model ────────────────────────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class AttnMIL(nn.Module):
     """
@@ -87,39 +89,80 @@ class AttnMIL(nn.Module):
       A    = Softmax(w · (V ⊙ U)) — per-patch attention weights
       z    = Σ A_i · h_i           — weighted slide representation
       logits = Dropout → Linear(z)
-
-    Args:
-        in_dim:      patch embedding dimension
-        hidden:      attention hidden dimension
-        num_classes: number of output classes
-        gated:       whether to use gated (V ⊙ U) or plain attention
-        dropout:     dropout rate on classifier head
     """
     def __init__(self, in_dim: int, hidden: int = HIDDEN,
-                 num_classes: int = 2, gated: bool = True, dropout: float = DROPOUT):
+                 num_classes: int = 2, dropout: float = DROPOUT):
         super().__init__()
         self.V   = nn.Sequential(nn.Linear(in_dim, hidden), nn.Tanh())
-        self.U   = nn.Sequential(nn.Linear(in_dim, hidden), nn.Sigmoid()) if gated else None
+        self.U   = nn.Sequential(nn.Linear(in_dim, hidden), nn.Sigmoid())
         self.w   = nn.Linear(hidden, 1)
         self.cls = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_dim, num_classes))
 
     def forward(self, h: torch.Tensor):
         """
         Args:
-            h: [N, d] patch embeddings (float32, single slide)
+            h: [N, d] patch embeddings (single slide)
         Returns:
             logits: [num_classes]
             A:      [N] attention weights
         """
         v = self.V(h)
-        a = v * self.U(h) if self.U else v
+        a = v * self.U(h)
         A = torch.softmax(self.w(a).squeeze(1), dim=0)          # [N]
         z = torch.sum(A.unsqueeze(1) * h, dim=0, keepdim=True)  # [1, d]
         logits = self.cls(z).squeeze(0)                          # [C]
         return logits, A
 
 
-# ── Evaluation ───────────────────────────────────────────────────────────────
+class TransMIL(nn.Module):
+    """
+    Transformer MIL classifier.
+
+    Architecture:
+      h     — [N, d] patch embeddings
+      h'    = TransformerEncoderLayer(h)   — models patch-patch relationships
+      z     = mean(h', dim=0)              — slide representation
+      logits = Dropout → Linear(z)
+
+    Uses a single nn.TransformerEncoderLayer (d_model=in_dim, nhead=8).
+    d_model must be divisible by nhead; raise HIDDEN or adjust nhead if needed.
+    """
+    def __init__(self, in_dim: int, num_classes: int = 2,
+                 nhead: int = 8, dropout: float = DROPOUT):
+        super().__init__()
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=in_dim,
+            nhead=nhead,
+            dim_feedforward=in_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cls = nn.Sequential(nn.Dropout(dropout), nn.Linear(in_dim, num_classes))
+
+    def forward(self, h: torch.Tensor):
+        """
+        Args:
+            h: [N, d] patch embeddings (single slide)
+        Returns:
+            logits: [num_classes]
+            A:      None (no explicit attention weights exposed)
+        """
+        x = self.transformer(h.unsqueeze(0))  # [1, N, d]
+        z = x.mean(dim=1)                     # [1, d]
+        logits = self.cls(z).squeeze(0)       # [C]
+        return logits, None
+
+
+def build_model(mil_type: str, in_dim: int, num_classes: int) -> nn.Module:
+    if mil_type == "attn":
+        return AttnMIL(in_dim, hidden=HIDDEN, num_classes=num_classes, dropout=DROPOUT)
+    elif mil_type == "transmil":
+        return TransMIL(in_dim, num_classes=num_classes, nhead=8, dropout=DROPOUT)
+    else:
+        raise ValueError(f"Unknown MIL_TYPE '{mil_type}'. Choose 'attn' or 'transmil'.")
+
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
 
 def evaluate(model: nn.Module, loader: DataLoader, num_classes: int):
     y_true, y_pred, y_prob = [], [], []
@@ -147,7 +190,6 @@ def evaluate(model: nn.Module, loader: DataLoader, num_classes: int):
 
 
 def plot_results(cm, y_true, y_prob, num_classes, class_names):
-    # Confusion matrix
     fig, ax = plt.subplots(figsize=(4, 4))
     im = ax.imshow(cm, cmap="Blues")
     ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -162,7 +204,6 @@ def plot_results(cm, y_true, y_prob, num_classes, class_names):
                     color="white" if cm[i, j] > th else "black")
     plt.tight_layout(); plt.show()
 
-    # ROC curve
     if num_classes == 2:
         fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
         auc = roc_auc_score(y_true, y_prob[:, 1])
@@ -182,19 +223,21 @@ def train():
 
     train_loader = DataLoader(
         SlideBagDataset(train_paths, max_patches=MAX_PATCHES_TRAIN, train=True),
-        batch_size=1, shuffle=True, collate_fn=collate_bags
+        batch_size=1, shuffle=True, collate_fn=collate_bags,
     )
     val_loader = DataLoader(
         SlideBagDataset(val_paths, max_patches=MAX_PATCHES_VAL, train=False),
-        batch_size=1, shuffle=False, collate_fn=collate_bags
+        batch_size=1, shuffle=False, collate_fn=collate_bags,
     )
 
-    # Infer embedding dimension from first file
-    in_dim = np.load(train_paths[0])["feats"].shape[1]
+    in_dim      = np.load(train_paths[0])["feats"].shape[1]
     num_classes = len(CLASS_NAMES)
-    print(f"Encoder dim: {in_dim} | Classes: {CLASS_NAMES}")
+    encoder_name = os.path.basename(FEAT_DIR.rstrip("/"))   # e.g. "slide_feats_resnet"
+    print(f"Encoder dir : {encoder_name}")
+    print(f"MIL type    : {MIL_TYPE}")
+    print(f"Feature dim : {in_dim} | Classes: {CLASS_NAMES}")
 
-    model = AttnMIL(in_dim, hidden=HIDDEN, num_classes=num_classes).to(device)
+    model = build_model(MIL_TYPE, in_dim, num_classes).to(device)
     opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     crit  = nn.CrossEntropyLoss()
 
@@ -214,15 +257,25 @@ def train():
         print(f"Epoch {epoch:02d} | loss={total_loss/len(train_loader):.4f} | "
               f"val_acc={acc:.3f} | val_auc={auc:.3f}")
 
-    # Final evaluation and plots
+    # Final evaluation
     acc, cm, y_true, y_pred, y_prob, auc = evaluate(model, val_loader, num_classes)
-    print(f"\nFinal  val_acc={acc:.3f} | val_auc={auc:.3f}")
     plot_results(cm, y_true, y_prob, num_classes, CLASS_NAMES)
 
     # Save model
-    save_path = os.path.join(FEAT_DIR, "attn_mil.pth")
+    save_path = os.path.join(FEAT_DIR, f"{MIL_TYPE}_mil.pth")
     torch.save(model.state_dict(), save_path)
     print(f"Model saved → {save_path}")
+
+    # Results summary
+    print("\n" + "=" * 45)
+    print("RESULTS SUMMARY")
+    print("=" * 45)
+    print(f"  Encoder : {encoder_name}")
+    print(f"  MIL type: {MIL_TYPE}")
+    print(f"  val_acc : {acc:.4f}")
+    print(f"  val_auc : {auc:.4f}")
+    print("=" * 45)
+
     return model
 
 

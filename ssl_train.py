@@ -16,7 +16,9 @@ from tqdm import tqdm
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 SSL_PATCH_DIR = "/kaggle/working/ssl_patches"
-SAVE_PATH     = "/kaggle/working/barlow_encoder_resnet50.pth"
+SAVE_PATH      = "/kaggle/working/barlow_encoder_resnet50.pth"
+CKPT_PATH      = "/kaggle/working/barlow_full_checkpoint.pth"
+CKPT_INTERVAL  = 5   # save full checkpoint every N epochs
 PROJ_DIM      = 128
 BATCH_SIZE    = 128
 NUM_EPOCHS    = 30
@@ -32,11 +34,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 bt_aug = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
     transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
     transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
     transforms.RandomGrayscale(p=0.2),
     transforms.GaussianBlur(kernel_size=9),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 
@@ -134,7 +137,17 @@ def train():
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1} | Avg Loss: {total_loss / len(loader):.4f}")
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch+1} | Avg Loss: {avg_loss:.4f}")
+
+        if (epoch + 1) % CKPT_INTERVAL == 0:
+            torch.save({
+                "epoch":                epoch + 1,
+                "model_state_dict":     model.module.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss":                 avg_loss,
+            }, CKPT_PATH)
+            print(f"  Checkpoint saved → {CKPT_PATH}")
 
     torch.save(model.module.backbone.state_dict(), SAVE_PATH)
     print(f"\nEncoder saved → {SAVE_PATH}")

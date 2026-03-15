@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+import cv2
 import openslide
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
@@ -35,20 +36,25 @@ def load_slide_key(path: str) -> pd.DataFrame:
     return df
 
 
-def tissue_mask(patch: Image.Image, white_thresh: float = 0.6, black_thresh: float = 0.2) -> bool:
+def tissue_mask(patch: Image.Image, sat_thresh: float = 0.05, min_sat_frac: float = 0.5, blur_thresh: float = 100.0) -> bool:
     """
     Returns True if patch contains sufficient tissue content.
 
     Args:
-        patch: PIL Image (RGB)
-        white_thresh: max fraction of pixels considered white (>0.9 intensity)
-        black_thresh: max fraction of pixels considered black (<0.1 intensity)
+        patch:        PIL Image (RGB)
+        sat_thresh:   minimum HSV saturation (0–1) for a pixel to count as tissue
+        min_sat_frac: minimum fraction of pixels that must exceed sat_thresh
+        blur_thresh:  minimum Laplacian variance; patches below this are too blurry
     """
-    gray = patch.convert("L")
-    arr = np.array(gray) / 255.0
-    white_frac = np.mean(arr > 0.9)
-    black_frac = np.mean(arr < 0.1)
-    return (white_frac < white_thresh) and (black_frac < black_thresh)
+    arr = np.array(patch)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    sat = hsv[:, :, 1] / 255.0
+    if np.mean(sat > sat_thresh) < min_sat_frac:
+        return False
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    if cv2.Laplacian(gray, cv2.CV_64F).var() < blur_thresh:
+        return False
+    return True
 
 
 def extract_patches(slide_path: str, slide_id: str, label: str, max_patches: int = MAX_PATCHES):
