@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+CLAUDE.md
+*.svs
+*.npz
+*.pt
+*.pth
+data/
+logs/
+.ipynb_checkpoints/

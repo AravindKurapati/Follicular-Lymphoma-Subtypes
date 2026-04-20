@@ -232,11 +232,11 @@ python attention_viz.py
 If you use this code or reference the approach, please cite:
 
 ```
-@article{kurapati2024pathology,
+@article{kurapati2026pathology,
   title   = {Pathology Meets Genomics: Predicting FL Transcriptional Subtypes from H&E Histology},
   author  = {Kurapati, Aravind S. and Park, Christopher and others},
   journal = {TBD},
-  year    = {2024}
+  year    = {2026}
 }
 ```
 
